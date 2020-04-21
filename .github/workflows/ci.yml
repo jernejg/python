@@ -1,0 +1,121 @@
+name: GitHub CI
+
+on:
+  pull_request:
+  push:
+  schedule:
+    - cron: 0 0 * * 0
+
+jobs:
+
+  generate:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: 'bash -Eeuo pipefail -x {0}'
+    outputs:
+      matrix: ${{ steps.generate.outputs.matrix }}
+      meta: ${{ steps.generate.outputs.meta }}
+    steps:
+      - uses: actions/checkout@v1
+      - name: 'Install bashbrew'
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/bin"
+          wget -O "$GITHUB_WORKSPACE/bin/bashbrew" 'https://doi-janky.infosiftr.net/job/bashbrew/lastSuccessfulBuild/artifact/bin/bashbrew-amd64'
+          chmod +x "$GITHUB_WORKSPACE/bin/bashbrew"
+          "$GITHUB_WORKSPACE/bin/bashbrew" --help > /dev/null
+          echo "::add-path::$GITHUB_WORKSPACE/bin"
+      - id: generate
+        name: 'Generate'
+        run: |
+          export BASHBREW_LIBRARY="$GITHUB_WORKSPACE/library"
+          mkdir -p "$BASHBREW_LIBRARY"
+          image="${GITHUB_REPOSITORY##*/}"
+          ./generate-stackbrew-library.sh > "$BASHBREW_LIBRARY/$image"
+          matrix="$(
+            bashbrew cat --format '
+              {{- range .Entries -}}
+                {{- json (.Tags | first) -}}
+                {{- "\n" -}}
+              {{- end -}}
+            ' "$image" \
+            | jq -cs '{ "name": . }'
+            # TODO somehow handle "rabbitmq:3.7.25-management" cleanly (inter-repository dependencies)
+          )"
+          echo "::set-output name=matrix::$matrix"
+          meta="$(
+            bashbrew cat --format '
+              {{- range .Entries -}}
+                {{- "{" -}}
+                  {{- json (.Tags | first) -}}
+                  {{- ": {" -}}
+                    {{- $tags := $.Tags "" false . -}}
+                    "tag": {{- json ($tags | first) -}}
+                    {{- "," -}}
+                    "tags": {{- json ($tags | join " ") -}}
+                    {{- "," -}}
+                    "directory": {{- json .Directory -}}
+                    {{- "," -}}
+                    "file": {{- json .File -}}
+                    {{- "," -}}
+                    "constraints": {{- json .Constraints -}}
+                  {{- "}" -}}
+                {{- "}\n" -}}
+              {{- end -}}
+            ' "$image" \
+            | jq -cs '
+              add
+              | map_values(
+                .os =
+                  if .constraints | contains(["windowsservercore-1809"]) then
+                    "windows-2019"
+                  elif .constraints | contains(["windowsservercore-ltsc2016"]) then
+                    "windows-2016"
+                  elif .constraints == [] or .constraints == ["aufs"] then
+                    "ubuntu-latest"
+                  else
+                    # use an intentionally invalid value so that GitHub chokes and we notice something is wrong
+                    "invalid-or-unknown"
+                  end
+              )
+            '
+          )"
+          echo "::set-output name=meta::$meta"
+
+  test:
+    needs: generate
+
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.generate.outputs.matrix) }}
+    runs-on: ${{ fromJson(needs.generate.outputs.meta)[matrix.name].os }}
+
+    defaults:
+      run:
+        shell: 'bash -Eeuo pipefail -x {0}'
+        working-directory: ${{ fromJson(needs.generate.outputs.meta)[matrix.name].directory }}
+    env:
+      TAG: ${{ fromJson(needs.generate.outputs.meta)[matrix.name].tag }}
+      TAGS: ${{ fromJson(needs.generate.outputs.meta)[matrix.name].tags }}
+      FILE: ${{ fromJson(needs.generate.outputs.meta)[matrix.name].file }}
+
+    steps:
+      - uses: actions/checkout@v1
+
+      - name: Prepare Environment
+        run: |
+          docker system prune --all --force --volumes
+          wget -qO- 'https://github.com/tianon/pgp-happy-eyeballs/raw/master/hack-my-builds.sh' | bash
+        if: runner.os == 'Linux'
+
+      - name: Build ${{ matrix.name }}
+        run: |
+          docker build $(xargs -n1 echo --tag <<<"$TAGS") --file "$FILE" --pull .
+
+      - name: Test ${{ matrix.name }}
+        run: |
+          git clone --depth 1 https://github.com/docker-library/official-images.git ~/oi
+          ~/oi/test/run.sh "$TAG"
+
+      - name: '"docker images"'
+        run: docker images
